@@ -1,0 +1,13 @@
+{
+  "name": "steam-gc-bot",
+  "version": "1.0.0",
+  "description": "Steam Game Coordinator bot for resolving CS2 match share codes to demo download URLs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "steam-user": "^5.2.0",
+    "globaloffensive": "^3.1.0"
+  }
+}
