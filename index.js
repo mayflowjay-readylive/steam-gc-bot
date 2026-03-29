@@ -176,6 +176,19 @@ client.on("loggedOn", () => {
 
   client.setPersona(SteamUser.EPersonaState.Online);
   client.gamesPlayed([730]);
+
+  // Actively grab the refresh token from the client object after a short delay
+  // (the refreshToken event doesn't always fire reliably)
+  setTimeout(() => {
+    if (client.refreshToken) {
+      console.log("[Steam] ═══════════════════════════════════════════");
+      console.log("[Steam] REFRESH TOKEN (save as STEAM_REFRESH_TOKEN env var):");
+      console.log(client.refreshToken);
+      console.log("[Steam] ═══════════════════════════════════════════");
+    } else {
+      console.log("[Steam] No refresh token available on client object");
+    }
+  }, 5000);
 });
 
 client.on("refreshToken", (token) => {
