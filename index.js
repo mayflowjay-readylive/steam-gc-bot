@@ -17,8 +17,8 @@ if (!STEAM_USERNAME || !STEAM_PASSWORD) {
 
 // ─── Steam Client Setup ───
 const client = new SteamUser({
-  dataDirectory: "/tmp/steam-data",
-  autoRelogin: true,
+  dataDirectory: null, // Don't cache credentials to avoid stale login conflicts
+  autoRelogin: false,  // We handle reconnection ourselves
 });
 const csgo = new GlobalOffensive(client);
 
@@ -68,7 +68,8 @@ function decodeMatchShareCode(code) {
 }
 
 // ─── GC Match Info Request ───
-function requestMatchInfo(matchId, outcomeId, token) {
+// Accepts either a share code string or { matchId, outcomeId, token } object
+function requestMatchInfo(shareCodeOrDetails) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       csgo.removeListener("matchList", onMatch);
@@ -112,7 +113,7 @@ function requestMatchInfo(matchId, outcomeId, token) {
     }
 
     csgo.on("matchList", onMatch);
-    csgo.requestGame(matchId, outcomeId, token);
+    csgo.requestGame(shareCodeOrDetails);
   });
 }
 
@@ -338,19 +339,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      let mid, oid, tok;
+      let gameDetails;
 
       if (shareCode) {
-        console.log(`[Resolve] Decoding share code: ${shareCode}`);
-        const decoded = decodeMatchShareCode(shareCode);
-        mid = decoded.matchId;
-        oid = decoded.outcomeId;
-        tok = decoded.token;
-        console.log(`[Resolve] Decoded → matchId=${mid} outcomeId=${oid} token=${tok}`);
+        console.log(`[Resolve] Using share code directly: ${shareCode}`);
+        gameDetails = shareCode;
       } else if (matchId && outcomeId && token !== undefined) {
-        mid = matchId;
-        oid = outcomeId;
-        tok = token;
+        console.log(`[Resolve] Using pre-decoded: matchId=${matchId} outcomeId=${outcomeId} token=${token}`);
+        gameDetails = { matchId, outcomeId, token };
       } else {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(
@@ -362,7 +358,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       console.log(`[Resolve] Requesting match info from GC...`);
-      const result = await requestMatchInfo(mid, oid, tok);
+      const result = await requestMatchInfo(gameDetails);
       console.log(`[Resolve] Got result: demoUrl=${result.demoUrl ? "YES" : "NO"}`);
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -419,10 +415,9 @@ const server = http.createServer(async (req, res) => {
 
     for (const code of codes) {
       try {
-        const decoded = decodeMatchShareCode(code);
         console.log(`[Batch] Resolving ${code}...`);
 
-        const result = await requestMatchInfo(decoded.matchId, decoded.outcomeId, decoded.token);
+        const result = await requestMatchInfo(code);
         results.push({ shareCode: code, ...result, error: null });
 
         await new Promise((r) => setTimeout(r, 2000));
