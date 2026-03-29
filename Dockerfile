@@ -2,7 +2,7 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Force rebuild: v3
+ADD "https://worldtimeapi.org/api/timezone/Etc/UTC" /tmp/bustcache
 COPY package.json ./
 RUN npm install --production
 
