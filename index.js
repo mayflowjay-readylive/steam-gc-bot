@@ -68,7 +68,7 @@ function decodeMatchShareCode(code) {
 }
 
 // ─── GC Match Info Request ───
-function requestMatchInfo(matchId, outcomeId, token) {
+function requestMatchInfo(shareCode) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       csgo.removeListener("matchList", onMatch);
@@ -114,8 +114,8 @@ function requestMatchInfo(matchId, outcomeId, token) {
     }
 
     csgo.on("matchList", onMatch);
-    console.log(`[GC] Calling requestGame(${matchId}, ${outcomeId}, ${token})`);
-    csgo.requestGame(matchId, outcomeId, token);
+    console.log(`[GC] Calling requestGame("${shareCode}")`);
+    csgo.requestGame(shareCode);
   });
 }
 
@@ -390,19 +390,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      let mid, oid, tok;
+      let resolveInput;
 
       if (shareCode) {
-        console.log(`[Resolve] Decoding share code: ${shareCode}`);
-        const decoded = decodeMatchShareCode(shareCode);
-        mid = decoded.matchId;
-        oid = decoded.outcomeId;
-        tok = decoded.token;
-        console.log(`[Resolve] Decoded → matchId=${mid} outcomeId=${oid} token=${tok}`);
+        const normalizedCode = shareCode.trim();
+        console.log(`[Resolve] Passing share code directly to GC: ${normalizedCode}`);
+        resolveInput = normalizedCode;
       } else if (matchId && outcomeId && token !== undefined) {
-        mid = matchId;
-        oid = outcomeId;
-        tok = token;
+        console.log(`[Resolve] Using pre-decoded: matchId=${matchId} outcomeId=${outcomeId} token=${token}`);
+        resolveInput = { matchId, outcomeId, token };
       } else {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(
@@ -414,7 +410,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       console.log(`[Resolve] Requesting match info from GC...`);
-      const result = await requestMatchInfo(mid, oid, tok);
+      const result = await requestMatchInfo(resolveInput);
       console.log(`[Resolve] Got result: demoUrl=${result.demoUrl ? "YES" : "NO"}`);
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -471,10 +467,9 @@ const server = http.createServer(async (req, res) => {
 
     for (const code of codes) {
       try {
-        const decoded = decodeMatchShareCode(code);
         console.log(`[Batch] Resolving ${code}...`);
 
-        const result = await requestMatchInfo(decoded.matchId, decoded.outcomeId, decoded.token);
+        const result = await requestMatchInfo(code.trim());
         results.push({ shareCode: code, ...result, error: null });
 
         await new Promise((r) => setTimeout(r, 2000));
