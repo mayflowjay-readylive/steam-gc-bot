@@ -68,7 +68,6 @@ function decodeMatchShareCode(code) {
 }
 
 // ─── GC Match Info Request ───
-// Accepts either a share code string or { matchId, outcomeId, token } object
 function requestMatchInfo(shareCodeOrDetails) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -80,8 +79,18 @@ function requestMatchInfo(shareCodeOrDetails) {
       clearTimeout(timeout);
       csgo.removeListener("matchList", onMatch);
 
+      // Log raw GC response for debugging
+      console.log(`[GC Raw] matchList response: ${JSON.stringify(data).slice(0, 500)}`);
+
       if (!data || !data.matches || data.matches.length === 0) {
-        reject(new Error("No match data returned from GC"));
+        resolve({
+          matchId: null,
+          matchTime: null,
+          demoUrl: null,
+          matchDuration: null,
+          expired: true,
+          rawMatch: null,
+        });
         return;
       }
 
@@ -113,6 +122,7 @@ function requestMatchInfo(shareCodeOrDetails) {
     }
 
     csgo.on("matchList", onMatch);
+    console.log(`[GC] Calling requestGame with: ${typeof shareCodeOrDetails === 'string' ? shareCodeOrDetails : JSON.stringify(shareCodeOrDetails)}`);
     csgo.requestGame(shareCodeOrDetails);
   });
 }
@@ -342,8 +352,11 @@ const server = http.createServer(async (req, res) => {
       let gameDetails;
 
       if (shareCode) {
-        console.log(`[Resolve] Using share code directly: ${shareCode}`);
-        gameDetails = shareCode;
+        // Decode ourselves and pass as object — the library's internal decoder may be broken
+        console.log(`[Resolve] Decoding share code: ${shareCode}`);
+        const decoded = decodeMatchShareCode(shareCode);
+        console.log(`[Resolve] Decoded → matchId=${decoded.matchId} outcomeId=${decoded.outcomeId} token=${decoded.token}`);
+        gameDetails = { matchId: decoded.matchId, outcomeId: decoded.outcomeId, token: decoded.token };
       } else if (matchId && outcomeId && token !== undefined) {
         console.log(`[Resolve] Using pre-decoded: matchId=${matchId} outcomeId=${outcomeId} token=${token}`);
         gameDetails = { matchId, outcomeId, token };
@@ -415,9 +428,10 @@ const server = http.createServer(async (req, res) => {
 
     for (const code of codes) {
       try {
-        console.log(`[Batch] Resolving ${code}...`);
+        console.log(`[Batch] Decoding and resolving ${code}...`);
+        const decoded = decodeMatchShareCode(code);
 
-        const result = await requestMatchInfo(code);
+        const result = await requestMatchInfo({ matchId: decoded.matchId, outcomeId: decoded.outcomeId, token: decoded.token });
         results.push({ shareCode: code, ...result, error: null });
 
         await new Promise((r) => setTimeout(r, 2000));
