@@ -17,13 +17,13 @@ if (!STEAM_USERNAME || !STEAM_PASSWORD) {
 
 // ─── Steam Client Setup ───
 const client = new SteamUser({
-  dataDirectory: "/tmp/steam-data",
-  autoRelogin: true,
+  autoRelogin: false, // We handle reconnection ourselves with exponential backoff
 });
 const csgo = new GlobalOffensive(client);
 
 let isReady = false;
 let isLoggedIn = false;
+let isLoggingIn = false;
 let manualReconnectTimer = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 120000; // 2 minutes max
@@ -41,7 +41,7 @@ function scheduleReconnect(reason) {
 
   manualReconnectTimer = setTimeout(() => {
     manualReconnectTimer = null;
-    if (!isLoggedIn) {
+    if (!isLoggedIn && !isLoggingIn) {
       console.log(`[Steam] Reconnecting (attempt ${reconnectAttempts})...`);
       loginToSteam();
     }
@@ -145,6 +145,12 @@ function requestMatchInfo(matchId, outcomeId, token) {
 
 // ─── Steam Login ───
 function loginToSteam() {
+  if (isLoggedIn || isLoggingIn) {
+    console.log("[Steam] Already logged in or login in progress, skipping");
+    return;
+  }
+
+  isLoggingIn = true;
   console.log(`[Steam] Logging in as ${STEAM_USERNAME}...`);
 
   let loginOptions;
@@ -166,6 +172,7 @@ function loginToSteam() {
     client.logOn(loginOptions);
   } catch (err) {
     console.error("[Steam] Login call failed:", err.message);
+    isLoggingIn = false;
     scheduleReconnect("login exception");
   }
 }
@@ -175,6 +182,7 @@ function loginToSteam() {
 client.on("loggedOn", () => {
   console.log("[Steam] Logged in successfully");
   isLoggedIn = true;
+  isLoggingIn = false;
   resetReconnectState(); // success — reset backoff
 
   client.setPersona(SteamUser.EPersonaState.Online);
@@ -208,6 +216,7 @@ client.on("steamGuard", (domain, callback, lastCodeWrong) => {
 client.on("error", (err) => {
   console.error(`[Steam] Client error: ${err.message}`);
   isLoggedIn = false;
+  isLoggingIn = false;
   isReady = false;
 
   // Don't call loginToSteam directly — autoRelogin may handle it.
@@ -218,6 +227,7 @@ client.on("error", (err) => {
 client.on("disconnected", (eresult, msg) => {
   console.warn(`[Steam] Disconnected: ${msg} (${eresult})`);
   isLoggedIn = false;
+  isLoggingIn = false;
   isReady = false;
 
   // autoRelogin should handle most cases, but schedule a fallback
@@ -248,7 +258,7 @@ csgo.on("error", (err) => {
 // Every 60 seconds, check if we should be connected but aren't.
 // This catches edge cases where both autoRelogin and scheduled reconnect fail.
 setInterval(() => {
-  if (!isLoggedIn && !manualReconnectTimer) {
+  if (!isLoggedIn && !isLoggingIn && !manualReconnectTimer) {
     console.log("[Monitor] Not logged in and no reconnect scheduled — forcing reconnect");
     scheduleReconnect("health monitor");
   }
