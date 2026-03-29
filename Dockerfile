@@ -2,9 +2,8 @@ FROM node:20-slim
 
 WORKDIR /app
 
-ADD "https://worldtimeapi.org/api/timezone/Etc/UTC" /tmp/bustcache
 COPY package.json ./
-RUN npm install --production
+RUN npm cache clean --force && npm install --production
 
 COPY index.js ./
 
