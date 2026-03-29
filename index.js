@@ -147,15 +147,19 @@ function requestMatchInfo(matchId, outcomeId, token) {
 function loginToSteam() {
   console.log(`[Steam] Logging in as ${STEAM_USERNAME}...`);
 
-  const loginOptions = {
-    accountName: STEAM_USERNAME,
-    password: STEAM_PASSWORD,
-  };
+  let loginOptions;
 
   if (REFRESH_TOKEN) {
     console.log("[Steam] Using refresh token for login");
-    loginOptions.refreshToken = REFRESH_TOKEN;
-    delete loginOptions.password;
+    loginOptions = {
+      refreshToken: REFRESH_TOKEN,
+    };
+  } else {
+    console.log("[Steam] Using username/password for login");
+    loginOptions = {
+      accountName: STEAM_USERNAME,
+      password: STEAM_PASSWORD,
+    };
   }
 
   try {
