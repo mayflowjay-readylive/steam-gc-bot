@@ -135,6 +135,7 @@ function loginToSteam() {
   if (REFRESH_TOKEN) {
     console.log("[Steam] Using refresh token for login");
     loginOptions.refreshToken = REFRESH_TOKEN;
+    delete loginOptions.accountName;
     delete loginOptions.password;
   }
 
