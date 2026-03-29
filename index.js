@@ -81,12 +81,22 @@ function requestMatchInfo(shareCode) {
 
       console.log(`[GC Raw] matchList response: ${JSON.stringify(data).slice(0, 500)}`);
 
-      if (!data || !data.matches || data.matches.length === 0) {
+      // The library may return data as { matches: [...] } or directly as an array [...]
+      let matches;
+      if (Array.isArray(data)) {
+        matches = data;
+      } else if (data && data.matches) {
+        matches = data.matches;
+      } else {
+        matches = [];
+      }
+
+      if (matches.length === 0) {
         reject(new Error("No match data returned from GC"));
         return;
       }
 
-      const match = data.matches[0];
+      const match = matches[0];
       const roundStats = match.roundstatsall || match.roundstats_legacy;
 
       let demoUrl = null;
