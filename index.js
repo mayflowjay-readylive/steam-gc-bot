@@ -68,7 +68,7 @@ function decodeMatchShareCode(code) {
 }
 
 // ─── GC Match Info Request ───
-function requestMatchInfo(shareCodeOrDetails) {
+function requestMatchInfo(matchId, outcomeId, token) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       csgo.removeListener("matchList", onMatch);
@@ -79,18 +79,10 @@ function requestMatchInfo(shareCodeOrDetails) {
       clearTimeout(timeout);
       csgo.removeListener("matchList", onMatch);
 
-      // Log raw GC response for debugging
       console.log(`[GC Raw] matchList response: ${JSON.stringify(data).slice(0, 500)}`);
 
       if (!data || !data.matches || data.matches.length === 0) {
-        resolve({
-          matchId: null,
-          matchTime: null,
-          demoUrl: null,
-          matchDuration: null,
-          expired: true,
-          rawMatch: null,
-        });
+        reject(new Error("No match data returned from GC"));
         return;
       }
 
@@ -122,8 +114,8 @@ function requestMatchInfo(shareCodeOrDetails) {
     }
 
     csgo.on("matchList", onMatch);
-    console.log(`[GC] Calling requestGame with: ${typeof shareCodeOrDetails === 'string' ? shareCodeOrDetails : JSON.stringify(shareCodeOrDetails)}`);
-    csgo.requestGame(shareCodeOrDetails);
+    console.log(`[GC] Calling requestGame(${matchId}, ${outcomeId}, ${token})`);
+    csgo.requestGame(matchId, outcomeId, token);
   });
 }
 
@@ -349,17 +341,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      let gameDetails;
+      let mid, oid, tok;
 
       if (shareCode) {
-        // Decode ourselves and pass as object — the library's internal decoder may be broken
         console.log(`[Resolve] Decoding share code: ${shareCode}`);
         const decoded = decodeMatchShareCode(shareCode);
-        console.log(`[Resolve] Decoded → matchId=${decoded.matchId} outcomeId=${decoded.outcomeId} token=${decoded.token}`);
-        gameDetails = { matchId: decoded.matchId, outcomeId: decoded.outcomeId, token: decoded.token };
+        mid = decoded.matchId;
+        oid = decoded.outcomeId;
+        tok = decoded.token;
+        console.log(`[Resolve] Decoded → matchId=${mid} outcomeId=${oid} token=${tok}`);
       } else if (matchId && outcomeId && token !== undefined) {
-        console.log(`[Resolve] Using pre-decoded: matchId=${matchId} outcomeId=${outcomeId} token=${token}`);
-        gameDetails = { matchId, outcomeId, token };
+        mid = matchId;
+        oid = outcomeId;
+        tok = token;
       } else {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(
@@ -371,7 +365,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       console.log(`[Resolve] Requesting match info from GC...`);
-      const result = await requestMatchInfo(gameDetails);
+      const result = await requestMatchInfo(mid, oid, tok);
       console.log(`[Resolve] Got result: demoUrl=${result.demoUrl ? "YES" : "NO"}`);
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -428,10 +422,10 @@ const server = http.createServer(async (req, res) => {
 
     for (const code of codes) {
       try {
-        console.log(`[Batch] Decoding and resolving ${code}...`);
         const decoded = decodeMatchShareCode(code);
+        console.log(`[Batch] Resolving ${code}...`);
 
-        const result = await requestMatchInfo({ matchId: decoded.matchId, outcomeId: decoded.outcomeId, token: decoded.token });
+        const result = await requestMatchInfo(decoded.matchId, decoded.outcomeId, decoded.token);
         results.push({ shareCode: code, ...result, error: null });
 
         await new Promise((r) => setTimeout(r, 2000));
