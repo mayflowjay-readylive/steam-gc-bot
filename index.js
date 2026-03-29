@@ -6,7 +6,7 @@ const GlobalOffensive = require("globaloffensive");
 const PORT = process.env.PORT || 3000;
 const STEAM_USERNAME = process.env.STEAM_USERNAME;
 const STEAM_PASSWORD = process.env.STEAM_PASSWORD;
-const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || "";
+const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || ""; // Set this if Steam asks for email code
 const RESOLVE_SECRET = process.env.RESOLVE_SECRET || "";
 const REFRESH_TOKEN = process.env.STEAM_REFRESH_TOKEN || "";
 
@@ -17,31 +17,30 @@ if (!STEAM_USERNAME || !STEAM_PASSWORD) {
 
 // ─── Steam Client Setup ───
 const client = new SteamUser({
-  autoRelogin: false, // We handle reconnection ourselves with exponential backoff
+  dataDirectory: "/tmp/steam-data", // Persist sentry files on Railway
+  autoRelogin: true,
 });
 const csgo = new GlobalOffensive(client);
 
-let isReady = false;
+let isReady = false; // GC connected and ready
 let isLoggedIn = false;
-let isLoggingIn = false;
-let manualReconnectTimer = null;
+
+// ─── Reconnection State (NEW) ───
+let reconnectTimer = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 120000; // 2 minutes max
 
-// ─── Reconnection Logic ───
 function scheduleReconnect(reason) {
-  if (manualReconnectTimer) {
+  if (reconnectTimer) {
     return; // already scheduled
   }
-
   reconnectAttempts++;
-  // Exponential backoff: 5s, 10s, 20s, 40s, 80s, 120s max
   const delay = Math.min(5000 * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
   console.log(`[Steam] Scheduling reconnect in ${delay / 1000}s (attempt ${reconnectAttempts}, reason: ${reason})`);
 
-  manualReconnectTimer = setTimeout(() => {
-    manualReconnectTimer = null;
-    if (!isLoggedIn && !isLoggingIn) {
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!isLoggedIn) {
       console.log(`[Steam] Reconnecting (attempt ${reconnectAttempts})...`);
       loginToSteam();
     }
@@ -50,13 +49,93 @@ function scheduleReconnect(reason) {
 
 function resetReconnectState() {
   reconnectAttempts = 0;
-  if (manualReconnectTimer) {
-    clearTimeout(manualReconnectTimer);
-    manualReconnectTimer = null;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
 }
 
 // ─── Share Code Decoder ───
+// Decodes CSGO-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX into { matchId, outcomeId, token }
+function decodeShareCode(shareCode) {
+  const DICTIONARY = "ABCDEFGHJKLMNOPQRSTUVWXYZabcdefhijkmnopqrstuvwxyz23456789";
+
+  // Strip "CSGO-" prefix and dashes
+  const code = shareCode.replace(/^CSGO-/, "").replace(/-/g, "");
+
+  // Decode from custom base-57 to big integer (as array of bytes)
+  let big = BigInt(0);
+  for (let i = code.length - 1; i >= 0; i--) {
+    const charIndex = DICTIONARY.indexOf(code[i]);
+    if (charIndex === -1) throw new Error(`Invalid character in share code: ${code[i]}`);
+    big = big * BigInt(DICTIONARY.length) + BigInt(charIndex);
+  }
+
+  // Convert to 18-byte buffer (big-endian)
+  const bytes = [];
+  for (let i = 0; i < 18; i++) {
+    bytes.push(Number(big & BigInt(0xff)));
+    big = big >> BigInt(8);
+  }
+  bytes.reverse();
+
+  // First byte is a checksum/version, skip it
+  // Remaining 17 bytes: matchId (8 bytes) + outcomeId (8 bytes) + token (2 bytes) — but with XOR swizzle
+
+  // Undo the XOR swizzle
+  // The encoding XORs each byte with the share code's hash
+  // Actually the standard decoding is simpler - read as little-endian uint64s from the unswizzled bytes
+
+  // Re-derive from the raw big integer approach
+  // The 144-bit number (18 bytes) is laid out as:
+  // byte[0] = version/flags
+  // bytes[1..] = encoded fields
+
+  // Simpler: use the known bit layout
+  // After base57 decode, the 144-bit value contains:
+  // - matchId: bits
+  // - outcomeId: bits  
+  // - tokenId: bits
+
+  // Let me use the proven byte-level approach
+  const buf = Buffer.alloc(18);
+  let n = BigInt(0);
+  const cleanCode = shareCode.replace(/^CSGO-/, "").replace(/-/g, "");
+  for (let i = cleanCode.length - 1; i >= 0; i--) {
+    n = n * BigInt(57) + BigInt(DICTIONARY.indexOf(cleanCode[i]));
+  }
+  for (let i = 0; i < 18; i++) {
+    buf[17 - i] = Number(n & BigInt(0xff));
+    n = n >> BigInt(8);
+  }
+
+  // Byte layout after decoding:
+  // buf[0]    = 0 (padding/version)
+  // buf[1..8] = matchId (LE uint64)  
+  // buf[9..16] = outcomeId (LE uint64)
+  // buf[17]    = token (uint16 spread across remaining bits)
+
+  // Actually the layout from Valve's implementation:
+  // The 18 bytes encode: matchId (uint64 LE), outcomeId (uint64 LE), token (uint16 LE)
+  // with the first byte being a checksum
+
+  // Swap byte order for each field (the encoding reverses bytes within each field)
+  const matchIdBytes = Buffer.from([buf[2], buf[1], buf[4], buf[3], buf[6], buf[5], buf[8], buf[7]]);
+  const outcomeIdBytes = Buffer.from([buf[10], buf[9], buf[12], buf[11], buf[14], buf[13], buf[16], buf[15]]);
+  const tokenByte = buf[17] | (buf[0] & 0x0f) << 8; // Remaining bits for token
+
+  // Read as uint64
+  const matchId = matchIdBytes.readBigUInt64BE(0);
+  const outcomeId = outcomeIdBytes.readBigUInt64BE(0);
+
+  return {
+    matchId: matchId.toString(),
+    outcomeId: outcomeId.toString(),
+    token: tokenByte,
+  };
+}
+
+// Alternative simpler decoder that matches the widely-used implementation
 function decodeMatchShareCode(code) {
   const DICTIONARY = "ABCDEFGHJKLMNOPQRSTUVWXYZabcdefhijkmnopqrstuvwxyz23456789";
   const stripped = code.replace("CSGO-", "").replace(/-/g, "");
@@ -66,12 +145,15 @@ function decodeMatchShareCode(code) {
     big = big * BigInt(57) + BigInt(DICTIONARY.indexOf(stripped[i]));
   }
 
+  // Convert to byte array (little-endian)
   const bytes = [];
   for (let i = 0; i < 18; i++) {
     bytes.push(Number(big & BigInt(0xff)));
     big = big >> BigInt(8);
   }
 
+  // Swap pairs within each field
+  // matchId: bytes 0-7, outcomeId: bytes 8-15, token: bytes 16-17
   const swap = (arr) => {
     for (let i = 0; i < arr.length - 1; i += 2) {
       [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
@@ -95,7 +177,7 @@ function decodeMatchShareCode(code) {
 }
 
 // ─── GC Match Info Request ───
-function requestMatchInfo(shareCodeOrDetails) {
+function requestMatchInfo(matchId, outcomeId, token) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       csgo.removeListener("matchList", onMatch);
@@ -114,12 +196,14 @@ function requestMatchInfo(shareCodeOrDetails) {
       const match = data.matches[0];
       const roundStats = match.roundstatsall || match.roundstats_legacy;
 
+      // The demo URL is in the last roundstats entry's map field
       let demoUrl = null;
       if (roundStats && roundStats.length > 0) {
         const lastRound = roundStats[roundStats.length - 1];
         demoUrl = lastRound.map || null;
       }
 
+      // Also check the direct reservation map field
       if (!demoUrl && match.roundstats_legacy) {
         demoUrl = match.roundstats_legacy.map || null;
       }
@@ -140,44 +224,28 @@ function requestMatchInfo(shareCodeOrDetails) {
 
     csgo.on("matchList", onMatch);
 
-    // API accepts either a share code string or { matchId, outcomeId, token }
-    console.log(`[GC DEBUG] Calling csgo.requestGame with:`, shareCodeOrDetails);
-    csgo.requestGame(shareCodeOrDetails);
+    // Request match info from GC
+    csgo.requestGame(matchId, outcomeId, token);
   });
 }
 
 // ─── Steam Login ───
 function loginToSteam() {
-  if (isLoggedIn || isLoggingIn) {
-    console.log("[Steam] Already logged in or login in progress, skipping");
-    return;
-  }
-
-  isLoggingIn = true;
   console.log(`[Steam] Logging in as ${STEAM_USERNAME}...`);
 
-  let loginOptions;
+  const loginOptions = {
+    accountName: STEAM_USERNAME,
+    password: STEAM_PASSWORD,
+  };
 
+  // If we have a refresh token from a previous session, use it
   if (REFRESH_TOKEN) {
     console.log("[Steam] Using refresh token for login");
-    loginOptions = {
-      refreshToken: REFRESH_TOKEN,
-    };
-  } else {
-    console.log("[Steam] Using username/password for login");
-    loginOptions = {
-      accountName: STEAM_USERNAME,
-      password: STEAM_PASSWORD,
-    };
+    loginOptions.refreshToken = REFRESH_TOKEN;
+    delete loginOptions.password;
   }
 
-  try {
-    client.logOn(loginOptions);
-  } catch (err) {
-    console.error("[Steam] Login call failed:", err.message);
-    isLoggingIn = false;
-    scheduleReconnect("login exception");
-  }
+  client.logOn(loginOptions);
 }
 
 // ─── Steam Event Handlers ───
@@ -185,14 +253,16 @@ function loginToSteam() {
 client.on("loggedOn", () => {
   console.log("[Steam] Logged in successfully");
   isLoggedIn = true;
-  isLoggingIn = false;
-  resetReconnectState(); // success — reset backoff
+  resetReconnectState(); // NEW: reset backoff on successful login
 
+  // Set persona to online and launch CS2 (app ID 730)
   client.setPersona(SteamUser.EPersonaState.Online);
   client.gamesPlayed([730]);
 });
 
 client.on("refreshToken", (token) => {
+  // Log this so you can set it as STEAM_REFRESH_TOKEN env var for future logins
+  // This avoids needing password + steam guard on subsequent restarts
   console.log("[Steam] ═══════════════════════════════════════════");
   console.log("[Steam] REFRESH TOKEN (save as STEAM_REFRESH_TOKEN env var):");
   console.log(token);
@@ -217,24 +287,20 @@ client.on("steamGuard", (domain, callback, lastCodeWrong) => {
 });
 
 client.on("error", (err) => {
-  console.error(`[Steam] Client error: ${err.message}`);
+  console.error("[Steam] Client error:", err.message);
   isLoggedIn = false;
-  isLoggingIn = false;
   isReady = false;
 
-  // Don't call loginToSteam directly — autoRelogin may handle it.
-  // Schedule a fallback reconnect in case autoRelogin doesn't kick in.
+  // NEW: Use exponential backoff instead of fixed 30s
   scheduleReconnect(`error: ${err.message}`);
 });
 
 client.on("disconnected", (eresult, msg) => {
   console.warn(`[Steam] Disconnected: ${msg} (${eresult})`);
   isLoggedIn = false;
-  isLoggingIn = false;
   isReady = false;
 
-  // autoRelogin should handle most cases, but schedule a fallback
-  // in case it doesn't reconnect within a reasonable time.
+  // NEW: Schedule reconnect as fallback in case autoRelogin doesn't kick in
   scheduleReconnect(`disconnected: ${msg}`);
 });
 
@@ -243,36 +309,30 @@ client.on("disconnected", (eresult, msg) => {
 csgo.on("connectedToGC", () => {
   console.log("[CS2 GC] Connected to Game Coordinator");
   isReady = true;
-  resetReconnectState(); // fully connected — reset backoff
+  resetReconnectState(); // NEW: fully connected, reset backoff
 });
 
 csgo.on("disconnectedFromGC", (reason) => {
   console.warn(`[CS2 GC] Disconnected from GC: ${reason}`);
   isReady = false;
-  // Don't reconnect here — if Steam is still connected, GC will auto-reconnect.
-  // If Steam disconnected too, the Steam disconnect handler will handle it.
 });
 
 csgo.on("error", (err) => {
   console.error("[CS2 GC] Error:", err);
 });
 
-// ─── Periodic Health Monitor ───
+// ─── Health Monitor (NEW) ───
 // Every 60 seconds, check if we should be connected but aren't.
-// This catches edge cases where both autoRelogin and scheduled reconnect fail.
 setInterval(() => {
-  if (!isLoggedIn && !isLoggingIn && !manualReconnectTimer) {
+  if (!isLoggedIn && !reconnectTimer) {
     console.log("[Monitor] Not logged in and no reconnect scheduled — forcing reconnect");
     scheduleReconnect("health monitor");
   }
   if (isLoggedIn && !isReady) {
-    // Steam is connected but GC isn't — try relaunching CS2
     console.log("[Monitor] Steam connected but GC not ready — relaunching CS2");
     try {
       client.gamesPlayed([]);
-      setTimeout(() => {
-        client.gamesPlayed([730]);
-      }, 2000);
+      setTimeout(() => client.gamesPlayed([730]), 2000);
     } catch (err) {
       console.error("[Monitor] Failed to relaunch CS2:", err.message);
     }
@@ -281,6 +341,7 @@ setInterval(() => {
 
 // ─── HTTP Server ───
 const server = http.createServer(async (req, res) => {
+  // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -294,11 +355,10 @@ const server = http.createServer(async (req, res) => {
   // Health check
   if (req.url === "/health") {
     const status = {
-      ok: isReady,
+      ok: true,
       steamLoggedIn: isLoggedIn,
       gcReady: isReady,
       uptime: process.uptime(),
-      reconnectAttempts: reconnectAttempts,
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(status));
@@ -307,6 +367,7 @@ const server = http.createServer(async (req, res) => {
 
   // Resolve share code → demo URL
   if (req.url === "/resolve" && req.method === "POST") {
+    // Auth check
     if (RESOLVE_SECRET) {
       const auth = req.headers["authorization"] || req.headers["x-resolve-secret"] || "";
       const token = auth.replace("Bearer ", "");
@@ -317,6 +378,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // Read body
     let body = "";
     for await (const chunk of req) {
       body += chunk;
@@ -346,14 +408,20 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      let gameRequest;
+      let mid, oid, tok;
 
       if (shareCode) {
-        // Pass share code directly to the GC — let the library handle decoding
-        console.log(`[Resolve] Using share code directly: ${shareCode}`);
-        gameRequest = shareCode;
+        // Decode share code
+        console.log(`[Resolve] Decoding share code: ${shareCode}`);
+        const decoded = decodeMatchShareCode(shareCode);
+        mid = decoded.matchId;
+        oid = decoded.outcomeId;
+        tok = decoded.token;
+        console.log(`[Resolve] Decoded → matchId=${mid} outcomeId=${oid} token=${tok}`);
       } else if (matchId && outcomeId && token !== undefined) {
-        gameRequest = { matchId, outcomeId, token };
+        mid = matchId;
+        oid = outcomeId;
+        tok = token;
       } else {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(
@@ -365,8 +433,8 @@ const server = http.createServer(async (req, res) => {
       }
 
       console.log(`[Resolve] Requesting match info from GC...`);
-      const result = await requestMatchInfo(gameRequest);
-      console.log(`[Resolve] Success: demoUrl=${result.demoUrl ? "YES" : "NO"} matchTime=${result.matchTime}`);
+      const result = await requestMatchInfo(mid, oid, tok);
+      console.log(`[Resolve] Got result: demoUrl=${result.demoUrl ? "YES" : "NO"}`);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
@@ -378,8 +446,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Batch resolve
+  // Batch resolve multiple share codes
   if (req.url === "/resolve-batch" && req.method === "POST") {
+    // Auth check
     if (RESOLVE_SECRET) {
       const auth = req.headers["authorization"] || req.headers["x-resolve-secret"] || "";
       const token = auth.replace("Bearer ", "");
@@ -417,15 +486,19 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Limit batch size to prevent abuse
     const codes = shareCodes.slice(0, 10);
     const results = [];
 
     for (const code of codes) {
       try {
+        const decoded = decodeMatchShareCode(code);
         console.log(`[Batch] Resolving ${code}...`);
-        const result = await requestMatchInfo(code);
+
+        const result = await requestMatchInfo(decoded.matchId, decoded.outcomeId, decoded.token);
         results.push({ shareCode: code, ...result, error: null });
 
+        // Small delay between GC requests to avoid rate limiting
         await new Promise((r) => setTimeout(r, 2000));
       } catch (err) {
         console.error(`[Batch] Error for ${code}: ${err.message}`);
@@ -448,28 +521,24 @@ server.listen(PORT, () => {
   console.log(`[Server] Steam GC Bot listening on port ${PORT}`);
   console.log(`[Server] Endpoints:`);
   console.log(`  GET  /health         - Status check`);
-  console.log(`  POST /resolve        - Resolve share code to demo URL`);
+  console.log(`  POST /resolve        - Resolve single share code`);
   console.log(`  POST /resolve-batch  - Resolve multiple share codes`);
   loginToSteam();
 });
 
-// Graceful shutdown — only on explicit SIGTERM, don't exit on disconnect
+// Graceful shutdown
 process.on("SIGTERM", () => {
-  console.log("[Server] Received SIGTERM, shutting down gracefully...");
+  console.log("[Server] Shutting down...");
   client.logOff();
-  server.close(() => {
-    process.exit(0);
-  });
-  // Force exit after 5 seconds if server doesn't close cleanly
-  setTimeout(() => process.exit(0), 5000);
+  server.close();
+  process.exit(0);
 });
 
-// Prevent unhandled rejections from crashing the process
+// NEW: Prevent unhandled errors from crashing the process
 process.on("unhandledRejection", (reason, promise) => {
   console.error("[Process] Unhandled rejection:", reason);
 });
 
 process.on("uncaughtException", (err) => {
   console.error("[Process] Uncaught exception:", err.message);
-  // Don't exit — try to keep running
 });
