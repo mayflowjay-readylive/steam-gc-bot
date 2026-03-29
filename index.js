@@ -300,6 +300,51 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Diagnostic: test GC with recent games + test share code decode
+  if (req.url === "/diag" && req.method === "GET") {
+    if (!isReady) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "GC not ready" }));
+      return;
+    }
+
+    const testCode = "CSGO-6BSaF-wqbqG-HopwS-NB8kT-b8KeB";
+    const decoded = decodeMatchShareCode(testCode);
+
+    // Test requestRecentGames to see if GC responds at all
+    const recentGamesPromise = new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        csgo.removeListener("matchList", handler);
+        resolve({ status: "timeout", data: null });
+      }, 15000);
+
+      function handler(data) {
+        clearTimeout(timeout);
+        csgo.removeListener("matchList", handler);
+        resolve({ status: "ok", data: JSON.stringify(data).slice(0, 1000) });
+      }
+
+      csgo.on("matchList", handler);
+      csgo.requestRecentGames();
+    });
+
+    const recentResult = await recentGamesPromise;
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      shareCodeTest: {
+        input: testCode,
+        decoded: decoded,
+        matchIdLength: decoded.matchId.length,
+        outcomeIdLength: decoded.outcomeId.length,
+      },
+      recentGames: recentResult,
+      gcReady: isReady,
+      steamLoggedIn: isLoggedIn,
+    }, null, 2));
+    return;
+  }
+
   // Resolve share code → demo URL
   if (req.url === "/resolve" && req.method === "POST") {
     if (RESOLVE_SECRET) {
