@@ -178,11 +178,15 @@ client.on("loggedOn", () => {
   isLoggingIn = false;
   reconnectAttempt = 0; // Reset backoff on success
 
-  client.setPersona(SteamUser.EPersonaState.Online);
-  client.gamesPlayed([730]);
+  // Stop any previous game session, wait, then relaunch for a clean GC connection
+  client.gamesPlayed([]);
+  setTimeout(() => {
+    client.setPersona(SteamUser.EPersonaState.Online);
+    client.gamesPlayed([730]);
+    console.log("[Steam] Launched CS2 (app 730)");
+  }, 2000);
 
   // Actively grab the refresh token from the client object after a short delay
-  // (the refreshToken event doesn't always fire reliably)
   setTimeout(() => {
     if (client.refreshToken) {
       console.log("[Steam] ═══════════════════════════════════════════");
@@ -192,7 +196,7 @@ client.on("loggedOn", () => {
     } else {
       console.log("[Steam] No refresh token available on client object");
     }
-  }, 5000);
+  }, 7000);
 });
 
 client.on("refreshToken", (token) => {
@@ -500,13 +504,19 @@ process.on("uncaughtException", (err) => {
 });
 
 // ─── Start ───
+const STARTUP_DELAY = 10000; // Wait 10s for old container to fully die
+
 server.listen(PORT, () => {
   console.log(`[Server] Steam GC Bot listening on port ${PORT}`);
   console.log(`[Server] Endpoints:`);
   console.log(`  GET  /health         - Status check`);
+  console.log(`  GET  /diag           - GC diagnostics`);
   console.log(`  POST /resolve        - Resolve single share code`);
   console.log(`  POST /resolve-batch  - Resolve multiple share codes`);
-  loginToSteam();
+  console.log(`[Server] Waiting ${STARTUP_DELAY/1000}s before login (letting old container die)...`);
+  setTimeout(() => {
+    loginToSteam();
+  }, STARTUP_DELAY);
 });
 
 // Graceful shutdown
