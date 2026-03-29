@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "steam-user": "^5.2.0",
-    "globaloffensive": "^3.1.0"
+    "steam-user": "5.2.0",
+    "globaloffensive": "3.1.0"
   }
 }
