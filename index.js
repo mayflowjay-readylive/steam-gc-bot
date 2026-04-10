@@ -1,6 +1,7 @@
 const http = require("http");
 const SteamUser = require("steam-user");
 const GlobalOffensive = require("globaloffensive");
+const SteamTotp = require("steam-totp");
 
 // ─── Config ───
 const PORT = process.env.PORT || 3000;
@@ -9,6 +10,7 @@ const STEAM_PASSWORD = process.env.STEAM_PASSWORD;
 const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || "";
 const RESOLVE_SECRET = process.env.RESOLVE_SECRET || "";
 const REFRESH_TOKEN = process.env.STEAM_REFRESH_TOKEN || "";
+const SHARED_SECRET = process.env.STEAM_SHARED_SECRET || ""; // For automatic TOTP 2FA
 
 if (!STEAM_USERNAME || !STEAM_PASSWORD) {
   console.error("STEAM_USERNAME and STEAM_PASSWORD env vars are required");
@@ -163,11 +165,17 @@ function loginToSteam() {
     password: STEAM_PASSWORD,
   };
 
+  // Prefer refresh token if available
   if (REFRESH_TOKEN) {
     console.log("[Steam] Using refresh token for login");
     loginOptions.refreshToken = REFRESH_TOKEN;
     delete loginOptions.accountName;
     delete loginOptions.password;
+  }
+  // If using TOTP and no refresh token, generate 2FA code automatically
+  else if (SHARED_SECRET) {
+    console.log("[Steam] Generating TOTP code for login");
+    loginOptions.twoFactorCode = SteamTotp.generateAuthCode(SHARED_SECRET);
   }
 
   try {
@@ -244,6 +252,7 @@ client.on("loggedOn", () => {
     console.log("[Steam] Launched CS2 (app 730)");
   }, 2000);
 
+  // Try to grab refresh token
   setTimeout(() => {
     if (client.refreshToken) {
       console.log("[Steam] ═══════════════════════════════════════════");
@@ -266,18 +275,30 @@ client.on("steamGuard", (domain, callback, lastCodeWrong) => {
     console.error("[Steam] Last Steam Guard code was WRONG");
   }
 
+  // Priority 1: TOTP shared secret — generates codes automatically forever
+  if (SHARED_SECRET) {
+    const code = SteamTotp.generateAuthCode(SHARED_SECRET);
+    console.log("[Steam] Auto-generated TOTP code for Steam Guard");
+    callback(code);
+    return;
+  }
+
+  // Priority 2: One-time code from env var
   if (STEAM_GUARD_CODE) {
     console.log("[Steam] Providing Steam Guard code from env var");
     callback(STEAM_GUARD_CODE);
-  } else {
-    const source = domain ? `email ending in ${domain}` : "mobile authenticator";
-    console.error(`[Steam] ═══════════════════════════════════════════`);
-    console.error(`[Steam] STEAM GUARD CODE REQUIRED (${source})`);
-    console.error(`[Steam] Set STEAM_GUARD_CODE env var and restart`);
-    console.error(`[Steam] ═══════════════════════════════════════════`);
-    isLoggingIn = false;
-    loginStartedAt = null;
+    return;
   }
+
+  // Priority 3: No way to authenticate — need manual intervention
+  const source = domain ? `email ending in ${domain}` : "mobile authenticator";
+  console.error(`[Steam] ═══════════════════════════════════════════`);
+  console.error(`[Steam] STEAM GUARD CODE REQUIRED (${source})`);
+  console.error(`[Steam] Set STEAM_SHARED_SECRET for automatic 2FA`);
+  console.error(`[Steam] Or set STEAM_GUARD_CODE env var and restart`);
+  console.error(`[Steam] ═══════════════════════════════════════════`);
+  isLoggingIn = false;
+  loginStartedAt = null;
 });
 
 client.on("error", (err) => {
@@ -289,8 +310,12 @@ client.on("error", (err) => {
 
   if (REFRESH_TOKEN && (err.message.includes("InvalidPassword") || err.message.includes("AccessDenied") || err.message.includes("Expired"))) {
     console.error("[Steam] ═══════════════════════════════════════════");
-    console.error("[Steam] Refresh token may be expired!");
-    console.error("[Steam] Delete STEAM_REFRESH_TOKEN env var and redeploy");
+    if (SHARED_SECRET) {
+      console.error("[Steam] Refresh token expired — will auto-login with TOTP on next attempt");
+    } else {
+      console.error("[Steam] Refresh token may be expired!");
+      console.error("[Steam] Delete STEAM_REFRESH_TOKEN env var and redeploy");
+    }
     console.error("[Steam] ═══════════════════════════════════════════");
   }
 
@@ -318,7 +343,6 @@ csgo.on("disconnectedFromGC", (reason) => {
   console.warn(`[CS2 GC] Disconnected from GC: ${reason}`);
   isReady = false;
 
-  // If still logged into Steam, try to reconnect GC by relaunching game
   if (isLoggedIn) {
     console.log("[CS2 GC] Still logged into Steam — relaunching game in 5s");
     setTimeout(() => {
@@ -388,6 +412,8 @@ const server = http.createServer(async (req, res) => {
       reconnectAttempt: reconnectAttempt,
       totalReconnects: totalReconnects,
       isLoggingIn: isLoggingIn,
+      hasTOTP: !!SHARED_SECRET,
+      hasRefreshToken: !!REFRESH_TOKEN,
       lastGcConnected: lastGcConnectedAt ? new Date(lastGcConnectedAt).toISOString() : null,
       lastSuccessfulResolve: lastSuccessfulResolve ? new Date(lastSuccessfulResolve).toISOString() : null,
     };
@@ -550,6 +576,7 @@ const STARTUP_DELAY = 10000;
 
 server.listen(PORT, () => {
   console.log(`[Server] Steam GC Bot v2.0 (self-healing) listening on port ${PORT}`);
+  console.log(`[Server] Auth: refreshToken=${!!REFRESH_TOKEN} totp=${!!SHARED_SECRET} guardCode=${!!STEAM_GUARD_CODE}`);
   console.log(`[Server] Endpoints:`);
   console.log(`  GET  /health         - Status check`);
   console.log(`  POST /resolve        - Resolve single share code`);
