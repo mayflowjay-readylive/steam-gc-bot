@@ -6,7 +6,7 @@ const GlobalOffensive = require("globaloffensive");
 const PORT = process.env.PORT || 3000;
 const STEAM_USERNAME = process.env.STEAM_USERNAME;
 const STEAM_PASSWORD = process.env.STEAM_PASSWORD;
-const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || ""; // Set this if Steam asks for email code
+const STEAM_GUARD_CODE = process.env.STEAM_GUARD_CODE || "";
 const RESOLVE_SECRET = process.env.RESOLVE_SECRET || "";
 const REFRESH_TOKEN = process.env.STEAM_REFRESH_TOKEN || "";
 
@@ -17,17 +17,28 @@ if (!STEAM_USERNAME || !STEAM_PASSWORD) {
 
 // ─── Steam Client Setup ───
 const client = new SteamUser({
-  dataDirectory: null, // Don't cache credentials to avoid stale login conflicts
-  autoRelogin: false,  // We handle reconnection ourselves
+  dataDirectory: null,
+  autoRelogin: false,
 });
 const csgo = new GlobalOffensive(client);
 
+// ─── State ───
 let isReady = false;
 let isLoggedIn = false;
-let isLoggingIn = false; // Guard against concurrent login attempts
+let isLoggingIn = false;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
-const MAX_RECONNECT_DELAY = 120000; // 2 minutes max
+let loginStartedAt = null;
+let lastGcConnectedAt = null;
+let lastSuccessfulResolve = null;
+let totalReconnects = 0;
+let gcRelaunching = false;
+
+const MAX_RECONNECT_DELAY = 120000;
+const LOGIN_STUCK_TIMEOUT = 60000;
+const GC_WAIT_TIMEOUT = 120000;
+const MAX_CONSECUTIVE_FAILURES = 15;
+const WATCHDOG_INTERVAL = 30000;
 
 // ─── Share Code Decoder ───
 function decodeMatchShareCode(code) {
@@ -81,7 +92,6 @@ function requestMatchInfo(shareCode) {
 
       console.log(`[GC Raw] matchList response: ${JSON.stringify(data).slice(0, 500)}`);
 
-      // The library may return data as { matches: [...] } or directly as an array [...]
       let matches;
       if (Array.isArray(data)) {
         matches = data;
@@ -109,6 +119,8 @@ function requestMatchInfo(shareCode) {
         demoUrl = match.roundstats_legacy.map || null;
       }
 
+      lastSuccessfulResolve = Date.now();
+
       resolve({
         matchId: match.matchid?.toString(),
         matchTime: match.matchtime,
@@ -129,15 +141,21 @@ function requestMatchInfo(shareCode) {
   });
 }
 
-// ─── Steam Login (with guard) ───
+// ─── Steam Login ───
 function loginToSteam() {
-  // Prevent concurrent login attempts
   if (isLoggingIn) {
-    console.log("[Steam] Login already in progress, skipping");
-    return;
+    if (loginStartedAt && Date.now() - loginStartedAt > LOGIN_STUCK_TIMEOUT) {
+      console.warn(`[Steam] Login stuck for ${Math.round((Date.now() - loginStartedAt) / 1000)}s — forcing reset`);
+      isLoggingIn = false;
+      loginStartedAt = null;
+    } else {
+      console.log("[Steam] Login already in progress, skipping");
+      return;
+    }
   }
 
   isLoggingIn = true;
+  loginStartedAt = Date.now();
   console.log(`[Steam] Logging in as ${STEAM_USERNAME}...`);
 
   const loginOptions = {
@@ -157,27 +175,56 @@ function loginToSteam() {
   } catch (err) {
     console.error("[Steam] logOn threw:", err.message);
     isLoggingIn = false;
+    loginStartedAt = null;
     scheduleReconnect("logOn exception");
   }
 }
 
 function scheduleReconnect(reason) {
-  // Clear any existing timer
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
 
   reconnectAttempt++;
-  // Exponential backoff: 10s, 20s, 40s, 80s, 120s cap
-  const delay = Math.min(10000 * Math.pow(2, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
+  totalReconnects++;
 
-  console.log(`[Steam] Scheduling reconnect in ${delay / 1000}s (attempt ${reconnectAttempt}, reason: ${reason})`);
+  if (reconnectAttempt >= MAX_CONSECUTIVE_FAILURES) {
+    console.error(`[Steam] ═══════════════════════════════════════════`);
+    console.error(`[Steam] ${MAX_CONSECUTIVE_FAILURES} consecutive reconnect failures — restarting process`);
+    console.error(`[Steam] Railway will auto-restart the container`);
+    console.error(`[Steam] ═══════════════════════════════════════════`);
+    process.exit(1);
+  }
+
+  const delay = Math.min(10000 * Math.pow(2, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
+  console.log(`[Steam] Scheduling reconnect in ${delay / 1000}s (attempt ${reconnectAttempt}/${MAX_CONSECUTIVE_FAILURES}, reason: ${reason})`);
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     loginToSteam();
   }, delay);
+}
+
+function relaunchGame() {
+  if (gcRelaunching) return;
+  gcRelaunching = true;
+  console.log("[Steam] Relaunching CS2 for fresh GC connection...");
+  try {
+    client.gamesPlayed([]);
+    setTimeout(() => {
+      try {
+        client.gamesPlayed([730]);
+        console.log("[Steam] CS2 relaunched");
+      } catch (err) {
+        console.error("[Steam] Failed to relaunch CS2:", err.message);
+      }
+      gcRelaunching = false;
+    }, 3000);
+  } catch (err) {
+    console.error("[Steam] Failed to stop games:", err.message);
+    gcRelaunching = false;
+  }
 }
 
 // ─── Steam Event Handlers ───
@@ -186,9 +233,10 @@ client.on("loggedOn", () => {
   console.log("[Steam] Logged in successfully");
   isLoggedIn = true;
   isLoggingIn = false;
-  reconnectAttempt = 0; // Reset backoff on success
+  loginStartedAt = null;
+  reconnectAttempt = 0;
 
-  // Stop any previous game session, wait, then relaunch for a clean GC connection
+  // Clean GC launch
   client.gamesPlayed([]);
   setTimeout(() => {
     client.setPersona(SteamUser.EPersonaState.Online);
@@ -196,15 +244,12 @@ client.on("loggedOn", () => {
     console.log("[Steam] Launched CS2 (app 730)");
   }, 2000);
 
-  // Actively grab the refresh token from the client object after a short delay
   setTimeout(() => {
     if (client.refreshToken) {
       console.log("[Steam] ═══════════════════════════════════════════");
       console.log("[Steam] REFRESH TOKEN (save as STEAM_REFRESH_TOKEN env var):");
       console.log(client.refreshToken);
       console.log("[Steam] ═══════════════════════════════════════════");
-    } else {
-      console.log("[Steam] No refresh token available on client object");
     }
   }, 7000);
 });
@@ -222,7 +267,7 @@ client.on("steamGuard", (domain, callback, lastCodeWrong) => {
   }
 
   if (STEAM_GUARD_CODE) {
-    console.log(`[Steam] Providing Steam Guard code from env var`);
+    console.log("[Steam] Providing Steam Guard code from env var");
     callback(STEAM_GUARD_CODE);
   } else {
     const source = domain ? `email ending in ${domain}` : "mobile authenticator";
@@ -230,8 +275,8 @@ client.on("steamGuard", (domain, callback, lastCodeWrong) => {
     console.error(`[Steam] STEAM GUARD CODE REQUIRED (${source})`);
     console.error(`[Steam] Set STEAM_GUARD_CODE env var and restart`);
     console.error(`[Steam] ═══════════════════════════════════════════`);
-    // Don't schedule reconnect here — user action needed
     isLoggingIn = false;
+    loginStartedAt = null;
   }
 });
 
@@ -240,8 +285,8 @@ client.on("error", (err) => {
   isLoggedIn = false;
   isReady = false;
   isLoggingIn = false;
+  loginStartedAt = null;
 
-  // If refresh token is the problem, log a helpful hint
   if (REFRESH_TOKEN && (err.message.includes("InvalidPassword") || err.message.includes("AccessDenied") || err.message.includes("Expired"))) {
     console.error("[Steam] ═══════════════════════════════════════════");
     console.error("[Steam] Refresh token may be expired!");
@@ -257,6 +302,7 @@ client.on("disconnected", (eresult, msg) => {
   isLoggedIn = false;
   isReady = false;
   isLoggingIn = false;
+  loginStartedAt = null;
   scheduleReconnect("disconnected");
 });
 
@@ -265,27 +311,60 @@ client.on("disconnected", (eresult, msg) => {
 csgo.on("connectedToGC", () => {
   console.log("[CS2 GC] Connected to Game Coordinator");
   isReady = true;
+  lastGcConnectedAt = Date.now();
 });
 
 csgo.on("disconnectedFromGC", (reason) => {
   console.warn(`[CS2 GC] Disconnected from GC: ${reason}`);
   isReady = false;
+
+  // If still logged into Steam, try to reconnect GC by relaunching game
+  if (isLoggedIn) {
+    console.log("[CS2 GC] Still logged into Steam — relaunching game in 5s");
+    setTimeout(() => {
+      if (isLoggedIn && !isReady) {
+        relaunchGame();
+      }
+    }, 5000);
+  }
 });
 
 csgo.on("error", (err) => {
   console.error("[CS2 GC] Error:", err);
 });
 
-// ─── Health Monitor ───
-// Single simple check every 60s — only acts if nothing else is handling reconnection
-const HEALTH_CHECK_INTERVAL = 60000;
-
+// ─── Watchdog: Catches ALL failure modes every 30s ───
 setInterval(() => {
-  if (!isLoggedIn && !isLoggingIn && !reconnectTimer) {
-    console.log("[Monitor] Not logged in and no reconnect scheduled — forcing reconnect");
-    scheduleReconnect("health monitor");
+  const now = Date.now();
+
+  // Case 1: Login is stuck
+  if (isLoggingIn && loginStartedAt && now - loginStartedAt > LOGIN_STUCK_TIMEOUT) {
+    console.warn(`[Watchdog] Login stuck for ${Math.round((now - loginStartedAt) / 1000)}s — resetting`);
+    isLoggingIn = false;
+    loginStartedAt = null;
+    scheduleReconnect("watchdog: login stuck");
+    return;
   }
-}, HEALTH_CHECK_INTERVAL);
+
+  // Case 2: Not logged in and nothing happening
+  if (!isLoggedIn && !isLoggingIn && !reconnectTimer) {
+    console.warn("[Watchdog] Not logged in, nothing scheduled — forcing reconnect");
+    scheduleReconnect("watchdog: idle");
+    return;
+  }
+
+  // Case 3: Logged in but GC not connected for too long
+  if (isLoggedIn && !isReady && !gcRelaunching) {
+    const loggedInDuration = lastGcConnectedAt
+      ? now - Math.max(lastGcConnectedAt, loginStartedAt || 0)
+      : now - (loginStartedAt || now);
+    if (loggedInDuration > GC_WAIT_TIMEOUT) {
+      console.warn(`[Watchdog] Logged in but GC not ready for ${Math.round(loggedInDuration / 1000)}s — relaunching game`);
+      relaunchGame();
+    }
+  }
+
+}, WATCHDOG_INTERVAL);
 
 // ─── HTTP Server ───
 const server = http.createServer(async (req, res) => {
@@ -302,60 +381,18 @@ const server = http.createServer(async (req, res) => {
   // Health check
   if (req.url === "/health") {
     const status = {
-      ok: true,
+      ok: isLoggedIn && isReady,
       steamLoggedIn: isLoggedIn,
       gcReady: isReady,
       uptime: process.uptime(),
       reconnectAttempt: reconnectAttempt,
+      totalReconnects: totalReconnects,
       isLoggingIn: isLoggingIn,
+      lastGcConnected: lastGcConnectedAt ? new Date(lastGcConnectedAt).toISOString() : null,
+      lastSuccessfulResolve: lastSuccessfulResolve ? new Date(lastSuccessfulResolve).toISOString() : null,
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(status));
-    return;
-  }
-
-  // Diagnostic: test GC with recent games + test share code decode
-  if (req.url === "/diag" && req.method === "GET") {
-    if (!isReady) {
-      res.writeHead(503, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "GC not ready" }));
-      return;
-    }
-
-    const testCode = "CSGO-6BSaF-wqbqG-HopwS-NB8kT-b8KeB";
-    const decoded = decodeMatchShareCode(testCode);
-
-    // Test requestRecentGames to see if GC responds at all
-    const recentGamesPromise = new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        csgo.removeListener("matchList", handler);
-        resolve({ status: "timeout", data: null });
-      }, 15000);
-
-      function handler(data) {
-        clearTimeout(timeout);
-        csgo.removeListener("matchList", handler);
-        resolve({ status: "ok", data: JSON.stringify(data).slice(0, 1000) });
-      }
-
-      csgo.on("matchList", handler);
-      csgo.requestRecentGames();
-    });
-
-    const recentResult = await recentGamesPromise;
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      shareCodeTest: {
-        input: testCode,
-        decoded: decoded,
-        matchIdLength: decoded.matchId.length,
-        outcomeIdLength: decoded.outcomeId.length,
-      },
-      recentGames: recentResult,
-      gcReady: isReady,
-      steamLoggedIn: isLoggedIn,
-    }, null, 2));
     return;
   }
 
@@ -499,7 +536,7 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-// ─── Catch unhandled errors (prevent crashes) ───
+// ─── Catch unhandled errors ───
 process.on("unhandledRejection", (err) => {
   console.error("[Process] Unhandled rejection:", err?.message || err);
 });
@@ -509,16 +546,15 @@ process.on("uncaughtException", (err) => {
 });
 
 // ─── Start ───
-const STARTUP_DELAY = 10000; // Wait 10s for old container to fully die
+const STARTUP_DELAY = 10000;
 
 server.listen(PORT, () => {
-  console.log(`[Server] Steam GC Bot listening on port ${PORT}`);
+  console.log(`[Server] Steam GC Bot v2.0 (self-healing) listening on port ${PORT}`);
   console.log(`[Server] Endpoints:`);
   console.log(`  GET  /health         - Status check`);
-  console.log(`  GET  /diag           - GC diagnostics`);
   console.log(`  POST /resolve        - Resolve single share code`);
   console.log(`  POST /resolve-batch  - Resolve multiple share codes`);
-  console.log(`[Server] Waiting ${STARTUP_DELAY/1000}s before login (letting old container die)...`);
+  console.log(`[Server] Waiting ${STARTUP_DELAY / 1000}s before login...`);
   setTimeout(() => {
     loginToSteam();
   }, STARTUP_DELAY);
@@ -528,7 +564,7 @@ server.listen(PORT, () => {
 process.on("SIGTERM", () => {
   console.log("[Server] Shutting down...");
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  client.logOff();
+  try { client.logOff(); } catch (e) {}
   server.close();
   process.exit(0);
 });
