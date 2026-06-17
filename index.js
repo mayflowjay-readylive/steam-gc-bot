@@ -92,7 +92,7 @@ function requestMatchInfo(shareCode) {
       clearTimeout(timeout);
       csgo.removeListener("matchList", onMatch);
 
-      console.log(`[GC Raw] matchList response: ${JSON.stringify(data).slice(0, 500)}`);
+      console.log(`[GC Raw] matchList response (first 500): ${JSON.stringify(data).slice(0, 500)}`);
 
       let matches;
       if (Array.isArray(data)) {
@@ -121,6 +121,61 @@ function requestMatchInfo(shareCode) {
         demoUrl = match.roundstats_legacy.map || null;
       }
 
+      // Extract player rankings from reservation data
+      let playerRankings = [];
+      try {
+        // Rankings can be in the match object, reservation, or last round stats
+        const sources = [
+          match.rankings,
+          match.reservation?.rankings,
+          roundStats && roundStats.length > 0 ? roundStats[roundStats.length - 1].reservation?.rankings : null,
+          roundStats && roundStats.length > 0 ? roundStats[0].reservation?.rankings : null,
+        ];
+
+        for (const source of sources) {
+          if (Array.isArray(source) && source.length > 0) {
+            playerRankings = source.map((r) => ({
+              accountId: r.account_id || r.accountId,
+              rankId: r.rank_id || r.rankId,       // CS Rating number (e.g., 18023)
+              rankType: r.rank_type || r.rankType,  // 11 = Premier, 6 = Competitive
+              rankChange: r.rank_change || r.rankChange || null,
+              wins: r.wins || null,
+            }));
+            break;
+          }
+        }
+
+        // Also extract account_ids for mapping
+        const accountIds = match.reservation?.account_ids
+          || (roundStats && roundStats.length > 0 ? roundStats[0].reservation?.account_ids : null)
+          || [];
+
+        // Log full reservation data for debugging rankings
+        const reservation = match.reservation
+          || (roundStats && roundStats.length > 0 ? roundStats[0].reservation : null);
+        if (reservation) {
+          console.log(`[GC Rankings] reservation keys: ${Object.keys(reservation).join(", ")}`);
+          console.log(`[GC Rankings] reservation data: ${JSON.stringify(reservation).slice(0, 2000)}`);
+        }
+        if (playerRankings.length > 0) {
+          console.log(`[GC Rankings] Found ${playerRankings.length} player rankings`);
+          console.log(`[GC Rankings] Sample: ${JSON.stringify(playerRankings[0])}`);
+        } else {
+          console.log(`[GC Rankings] No rankings found in response`);
+          // Log all keys at each level to find where rankings might be
+          if (roundStats && roundStats.length > 0) {
+            const lastRound = roundStats[roundStats.length - 1];
+            console.log(`[GC Rankings] Last round keys: ${Object.keys(lastRound).join(", ")}`);
+            if (lastRound.reservation) {
+              console.log(`[GC Rankings] Last round reservation keys: ${Object.keys(lastRound.reservation).join(", ")}`);
+            }
+          }
+          console.log(`[GC Rankings] Match top-level keys: ${Object.keys(match).join(", ")}`);
+        }
+      } catch (rankErr) {
+        console.error(`[GC Rankings] Error extracting rankings:`, rankErr.message);
+      }
+
       lastSuccessfulResolve = Date.now();
 
       resolve({
@@ -128,6 +183,7 @@ function requestMatchInfo(shareCode) {
         matchTime: match.matchtime,
         demoUrl: demoUrl,
         matchDuration: match.match_duration,
+        playerRankings: playerRankings,
         rawMatch: {
           matchtime: match.matchtime,
           matchDuration: match.match_duration,
@@ -594,4 +650,5 @@ process.on("SIGTERM", () => {
   try { client.logOff(); } catch (e) {}
   server.close();
   process.exit(0);
+});
 });
